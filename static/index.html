@@ -393,11 +393,14 @@ async function play(idx,q){
     else { img.style.display='none'; ph.style.display='flex'; }
 
     try{
-        aud.src='/api/stream?id='+encodeURIComponent(s.id);
-        aud.load();
-        aud.play();
-        hideLoad();
-    }catch{ hideLoad(); toast('❌ Connection error'); }
+    // Saavn returns a direct MP3 URL — just fetch it and play
+    const r = await fetch('/api/stream?id='+encodeURIComponent(s.id));
+    const d = await r.json();
+    if(!d.url){ hideLoad(); toast('❌ Track unavailable'); return; }
+    aud.src = d.url;
+    aud.load();
+    aud.play();
+}catch(e){ hideLoad(); toast('❌ Connection error'); }
 
     renderTab();
 

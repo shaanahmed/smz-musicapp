@@ -1,10 +1,12 @@
 """
-SMZ Music Player — Core Backend (AI Edition)
-Version: 6.1 — Proxy streaming: server fetches audio and pipes to browser
-         This bypasses YouTube IP blocks on cloud servers completely.
+SMZ Music Player — Core Backend
+Version: 7.0 — JioSaavn ONLY
+- Search: saavn.dev public API (no API key needed)
+- Stream: direct MP3 URLs from Saavn (no IP blocks, no yt-dlp)
+- AI: Groq (llama models)
 """
 
-import os, sys, json, subprocess, threading, re, random, string, glob, shutil, time
+import os, json, threading, re, random, string, time
 import urllib.request, urllib.parse
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
@@ -14,27 +16,6 @@ from urllib.parse import urlparse, parse_qs
 #  PATHS
 # ══════════════════════════════════════════════════════════
 HERE = Path(__file__).parent.resolve()
-TEMP = HERE / "tmp"
-
-def setup_env():
-    try:
-        if TEMP.exists(): shutil.rmtree(TEMP)
-        TEMP.mkdir(exist_ok=True)
-    except Exception as e:
-        print(f"  [System] Warning: {e}")
-
-# ══════════════════════════════════════════════════════════
-#  YTMUSICAPI
-# ══════════════════════════════════════════════════════════
-_ytm = None
-try:
-    from ytmusicapi import YTMusic
-    _ytm = YTMusic()
-    print("  [Search] ytmusicapi ready ✓")
-except ImportError:
-    print("  [Search] ytmusicapi not installed — using yt-dlp fallback")
-except Exception as e:
-    print(f"  [Search] ytmusicapi init failed ({e}) — using yt-dlp fallback")
 
 # ══════════════════════════════════════════════════════════
 #  GROQ AI
@@ -63,27 +44,18 @@ else:
     print("  [AI] No GROQ_API_KEY — AI features disabled.")
 
 # ══════════════════════════════════════════════════════════
-#  SHARED HELPERS
+#  HELPERS
 # ══════════════════════════════════════════════════════════
-def run_cmd(cmd, timeout=45):
-    try:
-        r = subprocess.run(cmd, shell=True, capture_output=True,
-                           text=True, encoding="utf-8", errors="ignore", timeout=timeout)
-        return r.stdout, r.stderr, r.returncode
-    except subprocess.TimeoutExpired:
-        return "", "Timed out", 1
-    except Exception as e:
-        return "", str(e), 1
-
-def _http_get(url, timeout=8):
+def _http_get(url, timeout=10):
+    """Simple HTTP GET → parsed JSON or None."""
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         })
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode())
+            return json.loads(r.read().decode("utf-8", errors="ignore"))
     except Exception as e:
-        print(f"  [HTTP] {url[:60]}... failed: {e}")
+        print(f"  [HTTP] {url[:70]}... → {e}")
         return None
 
 def _clean_json_array(text):
@@ -101,320 +73,101 @@ def _clean_json_obj(text):
 # ══════════════════════════════════════════════════════════
 def _ai_ask(prompt, max_tokens=512, temperature=0.7):
     if not _ai_client:
-        raise RuntimeError("AI client not initialised — set GROQ_API_KEY")
+        raise RuntimeError("AI not initialised — set GROQ_API_KEY")
     global _ai_model_name
     last_error = None
     for model in GROQ_MODELS:
         try:
-            response = _ai_client.chat.completions.create(
+            res = _ai_client.chat.completions.create(
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
             _ai_model_name = model
-            return response.choices[0].message.content
+            print(f"  [AI] ✓ {model}")
+            return res.choices[0].message.content
         except Exception as e:
             last_error = e
-            err_str = str(e)
-            print(f"  [AI] '{model}' failed: {err_str[:120]}")
-            if "rate_limit" in err_str.lower() or "429" in err_str:
+            err = str(e)
+            print(f"  [AI] {model} failed: {err[:100]}")
+            if "rate_limit" in err.lower() or "429" in err:
                 time.sleep(3)
                 continue
             break
-    raise RuntimeError(f"All Groq models failed. Last: {last_error}")
+    raise RuntimeError(f"All models failed: {last_error}")
 
 # ══════════════════════════════════════════════════════════
-#  SOURCE 1 — JIOSAAVN
+#  JIOSAAVN API
+#  saavn.dev is a free public API — no key, no rate limits
 # ══════════════════════════════════════════════════════════
-SAAVN_API = "https://saavn.dev/api"
+SAAVN = "https://saavn.dev/api"
 
-def _search_saavn(query, limit=5):
+def _best_url(download_urls):
+    """Pick best quality stream URL from Saavn downloadUrl array."""
+    if not download_urls:
+        return ""
+    for quality in ["320kbps", "160kbps", "96kbps", "48kbps"]:
+        for d in download_urls:
+            if d.get("quality") == quality and d.get("url"):
+                return d["url"]
+    # fallback: just return the last one
+    return download_urls[-1].get("url", "")
+
+def _fmt_track(s):
+    """Format a Saavn song object into our standard track dict."""
+    sid      = s.get("id", "")
+    imgs     = s.get("image", [])
+    thumb    = imgs[-1].get("url", "") if imgs else ""
+    artists  = s.get("artists", {}).get("primary", [])
+    uploader = ", ".join(a.get("name","") for a in artists) or "Unknown Artist"
+    url      = _best_url(s.get("downloadUrl", []))
+    return {
+        "id":         sid,
+        "title":      s.get("name", "Unknown"),
+        "uploader":   uploader,
+        "thumbnail":  thumb,
+        "stream_url": url,       # direct MP3 — browser plays this directly
+        "duration":   int(s.get("duration", 0)),
+        "source":     "saavn",
+    }
+
+def search_audio(query, limit=20):
+    """Search JioSaavn. Returns list of tracks with stream_url pre-filled."""
     try:
-        q = urllib.parse.quote(query)
-        data = _http_get(f"{SAAVN_API}/search/songs?query={q}&limit={limit}")
+        q    = urllib.parse.quote(query)
+        data = _http_get(f"{SAAVN}/search/songs?query={q}&limit={limit}")
         if not data:
             return []
         songs = data.get("data", {}).get("results", [])
-        results = []
-        for s in songs:
-            sid = s.get("id", "")
-            if not sid: continue
-            dl_urls = s.get("downloadUrl", [])
-            stream_url = ""
-            for quality in ["320kbps", "160kbps", "96kbps"]:
-                for d in dl_urls:
-                    if d.get("quality") == quality:
-                        stream_url = d.get("url", "")
-                        break
-                if stream_url: break
-            if not stream_url and dl_urls:
-                stream_url = dl_urls[-1].get("url", "")
-            imgs  = s.get("image", [])
-            thumb = imgs[-1].get("url", "") if imgs else ""
-            results.append({
-                "id":         f"saavn_{sid}",
-                "title":      s.get("name", "Unknown"),
-                "uploader":   ", ".join([a.get("name","") for a in s.get("artists",{}).get("primary",[])]) or "Unknown Artist",
-                "thumbnail":  thumb,
-                "source":     "saavn",
-                "stream_url": stream_url,
-                "duration":   s.get("duration", 0),
-            })
-        print(f"  [Saavn] {len(results)} results")
+        results = [_fmt_track(s) for s in songs if s.get("id")]
+        print(f"  [Saavn] '{query}' → {len(results)} results")
         return results
     except Exception as e:
-        print(f"  [Saavn] Error: {e}")
+        print(f"  [Saavn] Search error: {e}")
         return []
 
-# ══════════════════════════════════════════════════════════
-#  SOURCE 2 — YOUTUBE MUSIC
-# ══════════════════════════════════════════════════════════
-PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://piped-api.garudalinux.org",
-    "https://api.piped.projectsegfau.lt",
-]
-
-def _search_youtube(query, limit=5):
-    results = []
-    if _ytm:
-        try:
-            hits = _ytm.search(query, filter="songs", limit=limit)
-            for item in hits:
-                vid = item.get("videoId")
-                if not vid: continue
-                results.append({
-                    "id":         f"yt_{vid}",
-                    "title":      item.get("title", "Unknown"),
-                    "uploader":   ", ".join([a["name"] for a in item.get("artists",[])]) or "Unknown Artist",
-                    "thumbnail":  f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg",
-                    "source":     "youtube",
-                    "stream_url": "",
-                    "duration":   item.get("duration_seconds", 0),
-                })
-            print(f"  [YouTube] {len(results)} results")
-            return results
-        except Exception as e:
-            print(f"  [YouTube] ytmusicapi error: {e}")
-    safe_q = query.replace('"', '\\"')
-    cmd = (f'yt-dlp "ytsearch{limit}:{safe_q}" '
-           f'--no-warnings --no-download --print-json --skip-download 2>/dev/null')
-    out, _, _ = run_cmd(cmd, timeout=20)
-    for line in out.strip().splitlines():
-        try:
-            d = json.loads(line)
-            vid = d.get("id","")
-            if not vid: continue
-            results.append({
-                "id":         f"yt_{vid}",
-                "title":      d.get("title","Unknown"),
-                "uploader":   d.get("uploader","Unknown Artist"),
-                "thumbnail":  d.get("thumbnail", f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"),
-                "source":     "youtube",
-                "stream_url": "",
-                "duration":   d.get("duration", 0),
-            })
-        except Exception:
-            continue
-    print(f"  [YouTube/yt-dlp] {len(results)} results")
-    return results
-
-def _resolve_youtube_url(vid):
+def get_stream_url(sid):
     """
-    Resolve a YouTube video ID to a direct audio URL.
-    Tries Piped API first (no IP blocks), then yt-dlp fallback.
+    Get fresh stream URL for a Saavn song by ID.
+    Called by /api/stream — returns direct MP3 URL.
     """
-    for instance in PIPED_INSTANCES:
-        try:
-            data = _http_get(f"{instance}/streams/{vid}", timeout=8)
-            if not data: continue
-            streams = data.get("audioStreams", [])
-            if streams:
-                streams.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
-                url = streams[0].get("url", "")
-                if url:
-                    print(f"  [Resolve/YT] ✓ Piped {instance}")
-                    return url
-        except Exception as e:
-            print(f"  [Resolve/YT] Piped failed: {e}")
-    for client in ["tv_embedded", "web", "mweb"]:
-        cmd = (f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
-               f'--extractor-args "youtube:player_client={client}" '
-               f'--get-url --no-warnings --no-check-certificates '
-               f'"https://www.youtube.com/watch?v={vid}"')
-        out, err, _ = run_cmd(cmd, timeout=20)
-        url = out.strip().splitlines()[0] if out.strip() else ""
-        if url and url.startswith("http"):
-            print(f"  [Resolve/YT] ✓ yt-dlp client={client}")
-            return url
-    return ""
-
-# ══════════════════════════════════════════════════════════
-#  SOURCE 3 — SOUNDCLOUD
-# ══════════════════════════════════════════════════════════
-SC_CLIENT_ID = "iZIs9mchVcX5lhVRyQGGAYlNPVldzAoX"
-
-def _search_soundcloud(query, limit=5):
     try:
-        q    = urllib.parse.quote(query)
-        url  = (f"https://api-v2.soundcloud.com/search/tracks"
-                f"?q={q}&limit={limit}&client_id={SC_CLIENT_ID}")
-        data = _http_get(url, timeout=8)
-        if not data: return []
-        results = []
-        for item in data.get("collection", []):
-            tid = item.get("id","")
-            if not tid or not item.get("streamable", False): continue
-            results.append({
-                "id":         f"sc_{tid}",
-                "title":      item.get("title","Unknown"),
-                "uploader":   item.get("user",{}).get("username","Unknown Artist"),
-                "thumbnail":  (item.get("artwork_url") or
-                               item.get("user",{}).get("avatar_url","")).replace("large","t500x500"),
-                "source":     "soundcloud",
-                "stream_url": "",
-                "duration":   item.get("duration",0) // 1000,
-            })
-        print(f"  [SoundCloud] {len(results)} results")
-        return results
+        data = _http_get(f"{SAAVN}/songs/{sid}")
+        if not data:
+            return ""
+        songs = data.get("data", [])
+        if not songs:
+            return ""
+        url = _best_url(songs[0].get("downloadUrl", []))
+        print(f"  [Saavn] Stream ✓ {sid}")
+        return url
     except Exception as e:
-        print(f"  [SoundCloud] Error: {e}")
-        return []
-
-def _resolve_soundcloud_url(track_id):
-    try:
-        direct = (f"https://api.soundcloud.com/tracks/{track_id}/stream"
-                  f"?client_id={SC_CLIENT_ID}")
-        req = urllib.request.Request(direct, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            return r.url
-    except Exception as e:
-        print(f"  [Resolve/SC] {e}")
-    return ""
+        print(f"  [Saavn] Stream error: {e}")
+        return ""
 
 # ══════════════════════════════════════════════════════════
-#  UNIFIED SEARCH
-# ══════════════════════════════════════════════════════════
-def search_audio(query, limit=10):
-    per_source  = max(3, limit // 3)
-    results_map = {"saavn": [], "youtube": [], "soundcloud": []}
-
-    def _run(fn, key, q, lim):
-        try: results_map[key] = fn(q, lim)
-        except Exception as e: print(f"  [Search/{key}] {e}")
-
-    threads = [
-        threading.Thread(target=_run, args=(_search_saavn,      "saavn",      query, per_source), daemon=True),
-        threading.Thread(target=_run, args=(_search_youtube,    "youtube",    query, per_source), daemon=True),
-        threading.Thread(target=_run, args=(_search_soundcloud, "soundcloud", query, per_source), daemon=True),
-    ]
-    for t in threads: t.start()
-    for t in threads: t.join(timeout=12)
-
-    saavn, yt, sc = results_map["saavn"], results_map["youtube"], results_map["soundcloud"]
-    combined = []
-    for i in range(max(len(saavn), len(yt), len(sc))):
-        if i < len(saavn): combined.append(saavn[i])
-        if i < len(yt):    combined.append(yt[i])
-        if i < len(sc):    combined.append(sc[i])
-
-    print(f"  [Search] Total={len(combined)} (Saavn={len(saavn)}, YT={len(yt)}, SC={len(sc)})")
-    return combined[:limit * 2]
-
-# ══════════════════════════════════════════════════════════
-#  PROXY STREAM — the key fix for cloud IP blocks
-#  Instead of sending the audio URL to the browser,
-#  the SERVER fetches the audio and pipes it to the browser.
-#  YouTube/SoundCloud only see Render's server making requests,
-#  not a browser — so it works even on blocked IPs.
-# ══════════════════════════════════════════════════════════
-def proxy_stream(track_id, handler, range_header=None):
-    """
-    Resolve audio URL then proxy it through the server to the browser.
-    Supports Range requests for seeking.
-    """
-    # --- Resolve the direct audio URL ---
-    direct_url = ""
-
-    if track_id.startswith("saavn_"):
-        sid = track_id[6:]
-        try:
-            data = _http_get(f"{SAAVN_API}/songs/{sid}")
-            if data:
-                dl = data.get("data",[{}])[0].get("downloadUrl",[])
-                for quality in ["320kbps","160kbps","96kbps"]:
-                    for d in dl:
-                        if d.get("quality") == quality:
-                            direct_url = d.get("url","")
-                            break
-                    if direct_url: break
-        except Exception as e:
-            print(f"  [Proxy/Saavn] {e}")
-
-    elif track_id.startswith("yt_"):
-        direct_url = _resolve_youtube_url(track_id[3:])
-
-    elif track_id.startswith("sc_"):
-        direct_url = _resolve_soundcloud_url(track_id[3:])
-
-    else:
-        direct_url = _resolve_youtube_url(track_id)
-
-    if not direct_url:
-        handler._json({"error": "Could not resolve audio URL"}, 500)
-        return
-
-    # --- Proxy the audio stream ---
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "*/*",
-            "Accept-Encoding": "identity",
-            "Connection": "keep-alive",
-        }
-        if range_header:
-            headers["Range"] = range_header
-
-        req = urllib.request.Request(direct_url, headers=headers)
-        with urllib.request.urlopen(req, timeout=15) as upstream:
-            status      = upstream.status
-            content_type  = upstream.headers.get("Content-Type", "audio/mpeg")
-            content_length = upstream.headers.get("Content-Length", "")
-            content_range  = upstream.headers.get("Content-Range", "")
-
-            handler.send_response(206 if range_header else 200)
-            handler.send_header("Content-Type", content_type)
-            handler.send_header("Accept-Ranges", "bytes")
-            handler.send_header("Access-Control-Allow-Origin", "*")
-            if content_length:
-                handler.send_header("Content-Length", content_length)
-            if content_range:
-                handler.send_header("Content-Range", content_range)
-            handler.end_headers()
-
-            # Stream in chunks
-            chunk_size = 64 * 1024  # 64KB chunks
-            while True:
-                chunk = upstream.read(chunk_size)
-                if not chunk: break
-                try:
-                    handler.wfile.write(chunk)
-                except (BrokenPipeError, ConnectionResetError):
-                    print(f"  [Proxy] Client disconnected")
-                    break
-
-            print(f"  [Proxy] ✓ Streamed {track_id}")
-
-    except Exception as e:
-        print(f"  [Proxy] Error: {e}")
-        try:
-            handler._json({"error": str(e)}, 500)
-        except Exception:
-            pass
-
-# ══════════════════════════════════════════════════════════
-#  JOB STORE
+#  JOB STORE  (for async AI jobs)
 # ══════════════════════════════════════════════════════════
 _jobs: dict = {}
 
@@ -430,23 +183,27 @@ def _mood_worker(feeling, jid):
     try:
         prompt = (
             f"User feeling: '{feeling}'.\n"
-            "Recommend 10 real, well-known songs matching this mood.\n"
-            'Reply ONLY with a JSON array of strings: ["Song - Artist", ...]\n'
-            "No markdown, no extra text."
+            "Recommend 10 real well-known songs matching this mood.\n"
+            'Reply ONLY with a JSON array: ["Song Title - Artist", ...]\n'
+            "No markdown, no explanation."
         )
         raw   = _ai_ask(prompt, max_tokens=400)
         songs = json.loads(_clean_json_array(raw))
         if not isinstance(songs, list) or not songs:
-            raise ValueError("Empty AI response")
+            raise ValueError("Empty response")
     except Exception as e:
         _jobs[jid].update({"error": f"AI failed: {e}", "done": True})
         return
+
     resolved = []
     for s in songs:
         if isinstance(s, str) and s.strip():
             found = search_audio(s.strip(), limit=3)
-            if found: resolved.append(found[0])
+            if found:
+                resolved.append(found[0])
+
     _jobs[jid].update({"tracks": resolved, "done": True})
+    print(f"  [Mood] Done — {len(resolved)} tracks")
 
 # ══════════════════════════════════════════════════════════
 #  FEATURE 2 — TRACK INFO
@@ -457,17 +214,17 @@ def get_track_info(title, artist):
     def _worker():
         prompt = (
             f'Song: "{title}" by "{artist}".\n'
-            "Give a fun music-fan analysis. Respond ONLY as a JSON object:\n"
+            "Respond ONLY as JSON:\n"
             '{"vibe":"2-3 sentence mood/sound description",'
-            '"tags":["mood","genre","era","tag4","tag5"],'
+            '"tags":["tag1","tag2","tag3","tag4","tag5"],'
             '"fun_fact":"one interesting fact",'
             '"similar_artists":["Artist1","Artist2","Artist3"]}'
-            "\nNo markdown, pure JSON."
+            "\nNo markdown."
         )
         try:
             raw  = _ai_ask(prompt, max_tokens=400, temperature=0.6)
             data = json.loads(_clean_json_obj(raw))
-            for k in ("vibe","tags","fun_fact","similar_artists"):
+            for k in ("vibe", "tags", "fun_fact", "similar_artists"):
                 data.setdefault(k, "" if k not in ("tags","similar_artists") else [])
             result.update({"ok": True, "data": data})
         except Exception as e:
@@ -484,22 +241,27 @@ def get_track_info(title, artist):
 def _related_worker(title, artist, jid):
     try:
         prompt = (
-            f'User just listened to "{title}" by "{artist}".\n'
-            "Suggest 8 different songs with a similar vibe they would love.\n"
-            "Rules: different artists, same energy/genre/mood.\n"
+            f'Just listened to "{title}" by "{artist}".\n'
+            "Suggest 8 songs with a similar vibe.\n"
+            "Rules: different artists, same energy/mood/genre.\n"
             'Reply ONLY as JSON array: ["Song - Artist", ...]. No markdown.'
         )
         raw   = _ai_ask(prompt, max_tokens=300, temperature=0.85)
         songs = json.loads(_clean_json_array(raw))
-        if not isinstance(songs, list): raise ValueError("Bad format")
+        if not isinstance(songs, list):
+            raise ValueError("Bad format")
     except Exception:
-        songs = [f"{artist} best songs"]
+        songs = [f"{artist}"]
+
     resolved = []
     for s in songs:
         if isinstance(s, str) and s.strip():
-            found = search_audio(s.strip(), limit=3)
-            if found: resolved.append(found[0])
+            found = search_audio(s.strip(), limit=2)
+            if found:
+                resolved.append(found[0])
+
     _jobs[jid].update({"tracks": resolved, "done": True})
+    print(f"  [Related] Done — {len(resolved)} tracks")
 
 # ══════════════════════════════════════════════════════════
 #  HTTP SERVER
@@ -508,20 +270,20 @@ class SMZHandler(SimpleHTTPRequestHandler):
     def log_message(self, *a): pass
 
     def end_headers(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Origin",  "*")
         self.send_header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type,Range")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
         super().end_headers()
 
     def do_OPTIONS(self):
-        self.send_response(200); self.end_headers()
+        self.send_response(200)
+        self.end_headers()
 
     def _json(self, data, status=200):
         body = json.dumps(data).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type",   "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -529,7 +291,7 @@ class SMZHandler(SimpleHTTPRequestHandler):
         p  = urlparse(self.path)
         qs = parse_qs(p.query)
 
-        # Serve frontend
+        # ── Frontend ──────────────────────────────────────
         if p.path in ("/", "/index.html"):
             try:
                 fp = (HERE/"static"/"index.html"
@@ -537,7 +299,7 @@ class SMZHandler(SimpleHTTPRequestHandler):
                       else HERE/"index.html")
                 body = fp.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type",   "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -545,27 +307,29 @@ class SMZHandler(SimpleHTTPRequestHandler):
                 self._json({"error": str(e)}, 404)
             return
 
-        # Search
+        # ── Search ────────────────────────────────────────
         if p.path == "/api/search":
             q = qs.get("q", [""])[0].strip()
             self._json(search_audio(q) if q else [])
             return
 
-        # ══════════════════════════════════════════════════
-        #  STREAM — now proxied through server
-        #  Old: browser gets URL and fetches directly (blocked)
-        #  New: server fetches audio and pipes to browser (works!)
-        # ══════════════════════════════════════════════════
+        # ── Stream ────────────────────────────────────────
+        # Returns {"url": "https://..."} with the direct Saavn MP3 URL
+        # Frontend sets audio.src = url and plays directly
+        # No proxying needed — Saavn URLs work from any IP!
         if p.path == "/api/stream":
-            vid = qs.get("id", [""])[0].strip()
-            if not vid:
+            sid = qs.get("id", [""])[0].strip()
+            if not sid:
                 self._json({"error": "No id"}, 400)
                 return
-            range_header = self.headers.get("Range")
-            proxy_stream(vid, self, range_header)
+            url = get_stream_url(sid)
+            if url:
+                self._json({"url": url})
+            else:
+                self._json({"error": "Track not found on JioSaavn"}, 404)
             return
 
-        # Job poll
+        # ── Job poll ──────────────────────────────────────
         if p.path == "/api/job":
             jid = qs.get("id", [""])[0].strip()
             job = _jobs.get(jid)
@@ -573,24 +337,32 @@ class SMZHandler(SimpleHTTPRequestHandler):
                        200 if job else 404)
             return
 
-        # Track Info
+        # ── Track Info ────────────────────────────────────
         if p.path == "/api/info":
             title  = qs.get("title",  [""])[0].strip()
             artist = qs.get("artist", [""])[0].strip()
-            if not title:      self._json({"ok": False, "error": "No title"}, 400); return
-            if not _ai_client: self._json({"ok": False, "error": "AI not available"}, 503); return
+            if not title:
+                self._json({"ok": False, "error": "No title"}, 400)
+                return
+            if not _ai_client:
+                self._json({"ok": False, "error": "AI not available — set GROQ_API_KEY"}, 503)
+                return
             self._json(get_track_info(title, artist or "Unknown Artist"))
             return
 
-        # Related
+        # ── Related ───────────────────────────────────────
         if p.path == "/api/related":
             title  = qs.get("title",  [""])[0].strip()
             artist = qs.get("artist", [""])[0].strip()
-            if not title: self._json([], 400); return
+            if not title:
+                self._json([], 400)
+                return
             jid = _new_job("rel")
-            threading.Thread(target=_related_worker,
-                             args=(title, artist or "Unknown Artist", jid),
-                             daemon=True).start()
+            threading.Thread(
+                target=_related_worker,
+                args=(title, artist or "Unknown Artist", jid),
+                daemon=True
+            ).start()
             self._json({"job_id": jid})
             return
 
@@ -599,14 +371,23 @@ class SMZHandler(SimpleHTTPRequestHandler):
     def do_POST(self):
         p      = urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
-        try:    body = json.loads(self.rfile.read(length)) if length else {}
-        except: body = {}
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except Exception:
+            body = {}
 
+        # ── Mood Playlist ─────────────────────────────────
         if p.path == "/api/mood":
             feeling = body.get("feeling", "").strip()
-            if not feeling: self._json({"error": "No feeling"}, 400); return
+            if not feeling:
+                self._json({"error": "No feeling provided"}, 400)
+                return
             jid = _new_job("mood")
-            threading.Thread(target=_mood_worker, args=(feeling, jid), daemon=True).start()
+            threading.Thread(
+                target=_mood_worker,
+                args=(feeling, jid),
+                daemon=True
+            ).start()
             self._json({"job_id": jid})
             return
 
@@ -616,19 +397,16 @@ class SMZHandler(SimpleHTTPRequestHandler):
 #  BOOT
 # ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    setup_env()
     PORT = int(os.environ.get("PORT", 7860))
-    print("\n" + "━"*52)
-    print("  ✦  SMZ PLAYER BACKEND  v6.1  ✦")
-    print(f"  URL     : http://0.0.0.0:{PORT}")
-    print(f"  Sources : JioSaavn 🎵 | YouTube ▶️ | SoundCloud ☁️")
-    print(f"  Stream  : Proxied through server (no IP blocks)")
-    print(f"  Search  : {'ytmusicapi + yt-dlp' if _ytm else 'yt-dlp only'}")
-    print(f"  AI      : {'Groq (' + _ai_model_name + ')' if _ai_client else 'disabled'}")
-    print("━"*52 + "\n")
+    print("\n" + "━"*50)
+    print("  ✦  SMZ PLAYER  v7.0  ✦")
+    print(f"  URL    : http://0.0.0.0:{PORT}")
+    print(f"  Source : JioSaavn 🎵 (direct MP3, no blocks)")
+    print(f"  AI     : {'Groq (' + _ai_model_name + ')' if _ai_client else 'disabled (no GROQ_API_KEY)'}")
+    print("━"*50 + "\n")
     server = HTTPServer(("0.0.0.0", PORT), SMZHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n🛑 Server stopping...")
+        print("\n  Stopping...")
         server.server_close()
