@@ -359,8 +359,6 @@ if __name__ == "__main__":
     print("\n" + "━"*48)
     print("  ✦  SMZ PLAYER BACKEND  v5.0  ✦")
     print(f"  URL       : http://0.0.0.0:{PORT}")
-    print(f"  FFmpeg    : {'✅ ' + FFMPEG if FFMPEG != 'ffmpeg' else '⚠️  system ffmpeg'}")
-    print(f"  AI Model  : {'✅ ' + _ai_model_name if _ai_client else '❌ Unavailable'}")
     print(f"  Features  : Mood Playlist | Track Info | Recommender")
     print("━"*48 + "\n")
     
