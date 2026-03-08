@@ -1,23 +1,25 @@
-# 1. Start with a Python environment
-FROM python:3.10-slim
+# Use official Python image
+FROM python:3.9-slim
 
-# 2. Set the working directory inside the cloud server
+# Install FFmpeg (Crucial for your app)
+RUN apt-get update && apt-get install -y ffmpeg
+
+# Hugging Face requires a specific user setup to run safely
+RUN useradd -m -u 1000 user
+USER user
+ENV PATH="/home/user/.local/bin:$PATH"
+
 WORKDIR /app
 
-# 3. INSTALL FFMPEG (This is the line you asked about!)
-# This ensures the Linux server can process your music files
-RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# 4. Copy your requirements list and install the libraries
-COPY requirements.txt .
+# Copy requirements and install them
+COPY --chown=user requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 5. Copy everything else from your PC to the cloud server
-COPY . .
+# Copy all your code into the container
+COPY --chown=user . .
 
-# 6. Tell the server to use port 7860 (Hugging Face standard)
-ENV PORT=7860
+# Hugging Face ONLY listens on port 7860
 EXPOSE 7860
 
-# 7. Start the app
+# Start your server
 CMD ["python", "server.py"]
