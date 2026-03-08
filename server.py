@@ -1,6 +1,6 @@
 """
 SMZ Music Player — Core Backend (AI Edition)
-Version: 5.0 — New google-genai SDK + No startup ping
+Version: 5.1 — Bug fixes: duplicate _ai_ask, broken stream, blocked ytmusicapi
 """
 
 import os, sys, json, subprocess, threading, re, random, string, glob, shutil, time
@@ -22,26 +22,32 @@ def setup_env():
         print(f"  [System] Warning: {e}")
 
 def _find_ffmpeg():
-    # 1. First check if we are on a Linux cloud server (like Hugging Face)
-    # Most cloud servers have ffmpeg pre-installed in the system path
     if sys.platform != "win32":
         return "ffmpeg"
-
-    # 2. Local Windows logic (keep this so it still works on your PC!)
     for c in [HERE/"ffmpeg.exe", HERE/"ffmpeg"]:
         if c.exists(): return str(c)
-    
     lad = os.environ.get("LOCALAPPDATA", "")
     if lad:
         hits = glob.glob(os.path.join(lad,"Microsoft","WinGet","Packages",
                          "Gyan.FFmpeg*","**","ffmpeg.exe"), recursive=True)
         if hits: return hits[0]
-        
     return "ffmpeg"
 
 # ══════════════════════════════════════════════════════════
-#  GEMINI AI — new google-genai SDK
-#  No startup ping (saves quota on every boot)
+#  YTMUSICAPI — optional, with safe fallback
+# ══════════════════════════════════════════════════════════
+_ytm = None
+try:
+    from ytmusicapi import YTMusic
+    _ytm = YTMusic()
+    print("  [Search] ytmusicapi ready ✓")
+except ImportError:
+    print("  [Search] ytmusicapi not installed — using yt-dlp fallback")
+except Exception as e:
+    print(f"  [Search] ytmusicapi init failed ({e}) — using yt-dlp fallback")
+
+# ══════════════════════════════════════════════════════════
+#  GEMINI AI — google-genai SDK, single definition
 # ══════════════════════════════════════════════════════════
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 
@@ -91,17 +97,21 @@ def _clean_json_obj(text):
     s, e = text.find("{"), text.rfind("}")
     return text[s:e+1] if s != -1 and e > s else text
 
+# ══════════════════════════════════════════════════════════
+#  AI ASK — single, correct definition
+#  NOTE: time.sleep runs in background threads only (mood/related workers)
+#  so it never blocks the main server thread
+# ══════════════════════════════════════════════════════════
 def _ai_ask(prompt, max_tokens=512, temperature=0.7):
-    """Send prompt to Gemini using new google-genai SDK with model fallback."""
+    """Send prompt to Gemini with model fallback. Call only from worker threads."""
     if not _ai_client:
-        raise RuntimeError("AI client not initialised")
+        raise RuntimeError("AI client not initialised — set GEMINI_API_KEY")
 
     from google.genai import types
     global _ai_model_name
 
-    # --- THE RATE LIMIT FIX ---
-    # Pause for 2 seconds before asking Google, to prevent the 429 Quota Error
-    time.sleep(2) 
+    # Small delay to avoid 429s — safe here because we're always in a daemon thread
+    time.sleep(2)
 
     last_error = None
     for model in GEMINI_MODELS:
@@ -121,77 +131,89 @@ def _ai_ask(prompt, max_tokens=512, temperature=0.7):
             print(f"  [AI] '{model}' failed: {e}")
             continue
 
-    raise RuntimeError(f"All models failed. Last: {last_error}")
+    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
 
 # ══════════════════════════════════════════════════════════
-#  AUDIO ENGINE (ytmusicapi + yt-dlp)
+#  AUDIO ENGINE
 # ══════════════════════════════════════════════════════════
-# 1. ADD THIS AT THE TOP (around line 18)
-from ytmusicapi import YTMusic
-_ytm = YTMusic()
-
-# 2. REPLACE YOUR SEARCH_AUDIO (around line 125)
 def search_audio(query, limit=10):
-    """Uses ytmusicapi: faster and rarely blocked on Hugging Face"""
-    try:
-        # Search specifically for songs to get the best audio matches
-        search_results = _ytm.search(query, filter="songs", limit=limit)
-        results = []
-        for item in search_results:
-            vid = item.get("videoId")
-            if not vid: continue
-            
-            # Format results exactly how your frontend expects them
+    """
+    Primary: ytmusicapi (fast, rarely blocked)
+    Fallback: yt-dlp (slower but reliable)
+    """
+    # --- PRIMARY: ytmusicapi ---
+    if _ytm:
+        try:
+            search_results = _ytm.search(query, filter="songs", limit=limit)
+            results = []
+            for item in search_results:
+                vid = item.get("videoId")
+                if not vid:
+                    continue
+                results.append({
+                    "id": vid,
+                    "title": item.get("title", "Unknown Track"),
+                    "uploader": ", ".join([a["name"] for a in item.get("artists", [])]) if item.get("artists") else "Unknown Artist",
+                    "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+                })
+            if results:
+                return results
+            print(f"  [Search] ytmusicapi returned 0 results for '{query}', trying yt-dlp...")
+        except Exception as e:
+            print(f"  [Search] ytmusicapi error: {e} — falling back to yt-dlp")
+
+    # --- FALLBACK: yt-dlp ---
+    return _search_ytdlp(query, limit)
+
+def _search_ytdlp(query, limit=10):
+    """yt-dlp based search — reliable fallback."""
+    safe_q = query.replace('"', '\\"')
+    cmd = (
+        f'yt-dlp "ytsearch{limit}:{safe_q}" '
+        f'--no-warnings --no-download --print-json '
+        f'--skip-download 2>/dev/null'
+    )
+    out, err, code = run_cmd(cmd, timeout=30)
+    results = []
+    for line in out.strip().splitlines():
+        try:
+            d = json.loads(line)
+            vid = d.get("id") or d.get("webpage_url", "").split("v=")[-1]
+            if not vid:
+                continue
             results.append({
                 "id": vid,
-                "title": item.get("title", "Unknown Track"),
-                "uploader": ", ".join([a['name'] for a in item.get("artists", [])]) if item.get("artists") else "Unknown Artist",
-                "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+                "title": d.get("title", "Unknown Track"),
+                "uploader": d.get("uploader", "Unknown Artist"),
+                "thumbnail": d.get("thumbnail", f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg")
             })
-        return results
-    except Exception as e:
-        print(f"  [Search] Error: {e}")
-        return []
-
-# 3. UPDATE YOUR STREAM LOGIC (around line 155)
-def get_stream(vid):
-    """Spoofs an Android device to stop YouTube from blocking the music stream"""
-    cmd = (f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
-           f'--extractor-args "youtube:player_client=android" '
-           f'--get-url --no-warnings "https://www.youtube.com/watch?v={vid}"')
-    out, err, _ = run_cmd(cmd, timeout=30)
-    url = out.strip().splitlines()[0] if out.strip() else ""
-    return url, (err if not url else None)
-
-# 4. UPDATE YOUR AI ASK (around line 96)
-def _ai_ask(prompt, max_tokens=512, temperature=0.7):
-    if not _ai_client:
-        raise RuntimeError("AI client not initialised")
-
-    from google.genai import types
-    global _ai_model_name
-
-    # Delay to prevent '429 Resource Exhausted' with your new key
-    time.sleep(2) 
-
-    last_error = None
-    for model in GEMINI_MODELS:
-        try:
-            response = _ai_client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                )
-            )
-            _ai_model_name = model
-            return response.text
-        except Exception as e:
-            last_error = e
-            print(f"  [AI] '{model}' failed: {e}")
+        except Exception:
             continue
-    raise RuntimeError(f"All models failed. Last: {last_error}")
+    if not results and err:
+        print(f"  [Search/yt-dlp] Error: {err[:200]}")
+    return results
+
+def get_stream(vid):
+    """
+    FIX: 'android' player client is blocked on server IPs (Hugging Face, etc.)
+    Use 'web' as primary, 'mweb' as fallback — both work on cloud servers.
+    """
+    # Try web client first (most reliable on server IPs)
+    for client in ["web", "mweb", "ios"]:
+        cmd = (
+            f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
+            f'--extractor-args "youtube:player_client={client}" '
+            f'--get-url --no-warnings '
+            f'"https://www.youtube.com/watch?v={vid}"'
+        )
+        out, err, code = run_cmd(cmd, timeout=30)
+        url = out.strip().splitlines()[0] if out.strip() else ""
+        if url:
+            print(f"  [Stream] Got URL via client={client} for {vid}")
+            return url, None
+        print(f"  [Stream] client={client} failed for {vid}: {err[:100]}")
+
+    return "", "All player clients failed — video may be unavailable"
 
 # ══════════════════════════════════════════════════════════
 #  JOB STORE
@@ -226,7 +248,8 @@ def _mood_worker(feeling, jid):
     for s in songs:
         if isinstance(s, str) and s.strip():
             found = search_audio(s.strip(), limit=2)
-            if found: resolved.append(found[0])
+            if found:
+                resolved.append(found[0])
 
     if not resolved:
         _jobs[jid].update({"error": "No tracks resolved.", "done": True})
@@ -238,23 +261,38 @@ def _mood_worker(feeling, jid):
 #  FEATURE 2 — TRACK INFO
 # ══════════════════════════════════════════════════════════
 def get_track_info(title, artist):
-    prompt = (
-        f'Song: "{title}" by "{artist}".\n'
-        "Give a fun music-fan analysis. Respond ONLY as a JSON object:\n"
-        '{"vibe":"2-3 sentence mood/sound description",'
-        '"tags":["mood","genre","era","tag4","tag5"],'
-        '"fun_fact":"one interesting fact",'
-        '"similar_artists":["Artist1","Artist2","Artist3"]}'
-        "\nNo markdown, pure JSON."
-    )
-    try:
-        raw  = _ai_ask(prompt, max_tokens=400, temperature=0.6)
-        data = json.loads(_clean_json_obj(raw))
-        for k in ("vibe", "tags", "fun_fact", "similar_artists"):
-            data.setdefault(k, "" if k not in ("tags", "similar_artists") else [])
-        return {"ok": True, "data": data}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
+    # get_track_info is called directly from do_GET (main thread),
+    # so we run it in a thread to avoid blocking other requests
+    result = {}
+    event  = threading.Event()
+
+    def _worker():
+        prompt = (
+            f'Song: "{title}" by "{artist}".\n'
+            "Give a fun music-fan analysis. Respond ONLY as a JSON object:\n"
+            '{"vibe":"2-3 sentence mood/sound description",'
+            '"tags":["mood","genre","era","tag4","tag5"],'
+            '"fun_fact":"one interesting fact",'
+            '"similar_artists":["Artist1","Artist2","Artist3"]}'
+            "\nNo markdown, pure JSON."
+        )
+        try:
+            raw  = _ai_ask(prompt, max_tokens=400, temperature=0.6)
+            data = json.loads(_clean_json_obj(raw))
+            for k in ("vibe", "tags", "fun_fact", "similar_artists"):
+                data.setdefault(k, "" if k not in ("tags", "similar_artists") else [])
+            result.update({"ok": True, "data": data})
+        except Exception as e:
+            result.update({"ok": False, "error": str(e)})
+        finally:
+            event.set()
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    event.wait(timeout=30)  # wait up to 30s then give up
+    if not result:
+        return {"ok": False, "error": "AI request timed out"}
+    return result
 
 # ══════════════════════════════════════════════════════════
 #  FEATURE 3 — SMART RECOMMENDER
@@ -269,7 +307,8 @@ def _related_worker(title, artist, jid):
         )
         raw   = _ai_ask(prompt, max_tokens=300, temperature=0.85)
         songs = json.loads(_clean_json_array(raw))
-        if not isinstance(songs, list): raise ValueError("Bad format")
+        if not isinstance(songs, list):
+            raise ValueError("Bad format")
     except Exception:
         songs = [f"{artist} best songs"]
 
@@ -277,7 +316,8 @@ def _related_worker(title, artist, jid):
     for s in songs:
         if isinstance(s, str) and s.strip():
             found = search_audio(s.strip(), limit=1)
-            if found: resolved.append(found[0])
+            if found:
+                resolved.append(found[0])
 
     _jobs[jid].update({"tracks": resolved, "done": True})
 
@@ -352,7 +392,7 @@ class SMZHandler(SimpleHTTPRequestHandler):
             title  = qs.get("title",  [""])[0].strip()
             artist = qs.get("artist", [""])[0].strip()
             if not title:      self._json({"ok": False, "error": "No title"}, 400); return
-            if not _ai_client: self._json({"ok": False, "error": "AI not available"}, 503); return
+            if not _ai_client: self._json({"ok": False, "error": "AI not available — set GEMINI_API_KEY"}, 503); return
             self._json(get_track_info(title, artist or "Unknown Artist"))
             return
 
@@ -392,22 +432,20 @@ class SMZHandler(SimpleHTTPRequestHandler):
 # ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
     setup_env()
-    
-    # Hugging Face Spaces specifically looks for port 7860
-    PORT = int(os.environ.get("PORT", 7860)) 
-    
+
+    PORT = int(os.environ.get("PORT", 7860))
+
     print("\n" + "━"*48)
-    print("  ✦  SMZ PLAYER BACKEND  v5.0  ✦")
+    print("  ✦  SMZ PLAYER BACKEND  v5.1  ✦")
     print(f"  URL       : http://0.0.0.0:{PORT}")
     print(f"  Features  : Mood Playlist | Track Info | Recommender")
+    print(f"  Search    : {'ytmusicapi + yt-dlp fallback' if _ytm else 'yt-dlp only'}")
+    print(f"  AI        : {'Gemini ready' if _ai_client else 'disabled (no API key)'}")
     print("━"*48 + "\n")
-    
-    # Start the server on 0.0.0.0 to ensure it's accessible via the tunnel
+
     server = HTTPServer(("0.0.0.0", PORT), SMZHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\n🛑 Server stopping...")
         server.server_close()
-
-
