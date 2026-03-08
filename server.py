@@ -126,47 +126,72 @@ def _ai_ask(prompt, max_tokens=512, temperature=0.7):
 # ══════════════════════════════════════════════════════════
 #  AUDIO ENGINE (ytmusicapi + yt-dlp)
 # ══════════════════════════════════════════════════════════
+# 1. ADD THIS AT THE TOP (around line 18)
 from ytmusicapi import YTMusic
 _ytm = YTMusic()
 
+# 2. REPLACE YOUR SEARCH_AUDIO (around line 125)
 def search_audio(query, limit=10):
-    """Uses ytmusicapi for fast, unblockable searching"""
+    """Uses ytmusicapi: faster and rarely blocked on Hugging Face"""
     try:
+        # Search specifically for songs to get the best audio matches
         search_results = _ytm.search(query, filter="songs", limit=limit)
         results = []
-        seen = set()
-        
         for item in search_results:
             vid = item.get("videoId")
-            if not vid or vid in seen: continue
-            seen.add(vid)
+            if not vid: continue
             
-            title = item.get("title", "Unknown Track")
-            artists = ", ".join([a.get("name", "") for a in item.get("artists", [])]) if item.get("artists") else "Unknown Artist"
-            
-            thumbs = item.get("thumbnails", [])
-            thumb = thumbs[-1]["url"] if thumbs else f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
-            
+            # Format results exactly how your frontend expects them
             results.append({
                 "id": vid,
-                "title": title,
-                "uploader": artists,
-                "thumbnail": thumb
+                "title": item.get("title", "Unknown Track"),
+                "uploader": ", ".join([a['name'] for a in item.get("artists", [])]) if item.get("artists") else "Unknown Artist",
+                "thumbnail": f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
             })
         return results
     except Exception as e:
         print(f"  [Search] Error: {e}")
         return []
 
+# 3. UPDATE YOUR STREAM LOGIC (around line 155)
 def get_stream(vid):
-    """Uses yt-dlp to extract the actual audio URL, spoofing an Android client to bypass blocks"""
+    """Spoofs an Android device to stop YouTube from blocking the music stream"""
     cmd = (f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
            f'--extractor-args "youtube:player_client=android" '
            f'--get-url --no-warnings "https://www.youtube.com/watch?v={vid}"')
-    
     out, err, _ = run_cmd(cmd, timeout=30)
     url = out.strip().splitlines()[0] if out.strip() else ""
     return url, (err if not url else None)
+
+# 4. UPDATE YOUR AI ASK (around line 96)
+def _ai_ask(prompt, max_tokens=512, temperature=0.7):
+    if not _ai_client:
+        raise RuntimeError("AI client not initialised")
+
+    from google.genai import types
+    global _ai_model_name
+
+    # Delay to prevent '429 Resource Exhausted' with your new key
+    time.sleep(2) 
+
+    last_error = None
+    for model in GEMINI_MODELS:
+        try:
+            response = _ai_client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_tokens,
+                )
+            )
+            _ai_model_name = model
+            return response.text
+        except Exception as e:
+            last_error = e
+            print(f"  [AI] '{model}' failed: {e}")
+            continue
+    raise RuntimeError(f"All models failed. Last: {last_error}")
 
 # ══════════════════════════════════════════════════════════
 #  JOB STORE

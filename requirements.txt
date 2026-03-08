@@ -1,4 +1,5 @@
-yt-dlp
-spotdl
-google-genai
 flask
+google-genai
+yt-dlp
+ytmusicapi
+spotdl
