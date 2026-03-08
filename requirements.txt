@@ -1,5 +1,4 @@
-flask
-google-genai
 yt-dlp
 ytmusicapi
-spotdl
+google-genai
+google-auth==2.29.0
