@@ -200,11 +200,12 @@ def _search_ytdlp(query, limit=10):
 
 def get_stream(vid):
     """
-    Stream fix for cloud server IPs (Render, HF, etc.)
-    tv_embedded is the most reliable client for server IPs — no sign-in needed.
-    Falls back through multiple clients automatically.
+    YouTube blocks yt-dlp on cloud IPs in 2025.
+    Strategy:
+    1. Try yt-dlp with multiple clients
+    2. Fall back to Piped API (open source YouTube proxy — no IP blocks)
     """
-    # tv_embedded works best on cloud IPs — YouTube treats it as an embedded TV player
+    # --- ATTEMPT 1: yt-dlp with multiple clients ---
     for client in ["tv_embedded", "mediaconnect", "web_creator", "web", "mweb"]:
         cmd = (
             f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
@@ -212,26 +213,43 @@ def get_stream(vid):
             f'--get-url --no-warnings --no-check-certificates '
             f'"https://www.youtube.com/watch?v={vid}"'
         )
-        out, err, code = run_cmd(cmd, timeout=35)
+        out, err, code = run_cmd(cmd, timeout=20)
         url = out.strip().splitlines()[0] if out.strip() else ""
         if url and url.startswith("http"):
-            print(f"  [Stream] ✓ Got URL via client={client} for {vid}")
+            print(f"  [Stream] ✓ yt-dlp client={client} for {vid}")
             return url, None
-        print(f"  [Stream] ✗ client={client} failed for {vid}: {err[:120]}")
+        print(f"  [Stream] ✗ client={client} failed: {err[:80]}")
 
-    # Last resort: try without specifying client at all
-    cmd = (
-        f'yt-dlp -f "bestaudio/best" '
-        f'--get-url --no-warnings --no-check-certificates '
-        f'"https://www.youtube.com/watch?v={vid}"'
-    )
-    out, err, _ = run_cmd(cmd, timeout=35)
-    url = out.strip().splitlines()[0] if out.strip() else ""
-    if url and url.startswith("http"):
-        print(f"  [Stream] ✓ Got URL via default client for {vid}")
-        return url, None
+    # --- ATTEMPT 2: Piped API (open source YouTube front-end, no IP blocks) ---
+    print(f"  [Stream] Trying Piped API fallback for {vid}...")
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://piped-api.garudalinux.org",
+        "https://api.piped.projectsegfau.lt",
+    ]
+    import urllib.request
+    for instance in piped_instances:
+        try:
+            req = urllib.request.Request(
+                f"{instance}/streams/{vid}",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+            # Pick best audio stream
+            streams = data.get("audioStreams", [])
+            if streams:
+                # Sort by bitrate descending, pick best
+                streams.sort(key=lambda x: x.get("bitrate", 0), reverse=True)
+                url = streams[0].get("url", "")
+                if url:
+                    print(f"  [Stream] ✓ Piped API ({instance}) for {vid}")
+                    return url, None
+        except Exception as e:
+            print(f"  [Stream] ✗ Piped {instance} failed: {e}")
+            continue
 
-    return "", "All player clients failed — video may be geo-blocked or unavailable"
+    return "", "All stream methods failed — YouTube is blocking this server IP"
 
 # ══════════════════════════════════════════════════════════
 #  JOB STORE
