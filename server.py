@@ -101,7 +101,7 @@ def _ai_ask(prompt, max_tokens=512, temperature=0.7):
 #  JIOSAAVN API
 #  saavn.dev is a free public API — no key, no rate limits
 # ══════════════════════════════════════════════════════════
-SAAVN = "https://saavn.dev/api"
+SAAVN = "https://jiosaavn-api-instance-mu.vercel.app/api"
 
 def _best_url(download_urls):
     """Pick best quality stream URL from Saavn downloadUrl array."""
