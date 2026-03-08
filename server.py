@@ -1,6 +1,6 @@
 """
 SMZ Music Player — Core Backend (AI Edition)
-Version: 5.1 — Bug fixes: duplicate _ai_ask, broken stream, blocked ytmusicapi
+Version: 5.2 — Fix: stream uses tv_embedded client, AI uses longer backoff + model fallback
 """
 
 import os, sys, json, subprocess, threading, re, random, string, glob, shutil, time
@@ -47,32 +47,33 @@ except Exception as e:
     print(f"  [Search] ytmusicapi init failed ({e}) — using yt-dlp fallback")
 
 # ══════════════════════════════════════════════════════════
-#  GEMINI AI — google-genai SDK, single definition
+#  GROQ AI — fast, free, reliable
 # ══════════════════════════════════════════════════════════
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
 
-GEMINI_MODELS = [
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
+# Models in priority order — falls back if one is overloaded
+GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+    "gemma2-9b-it",
+    "mixtral-8x7b-32768",
 ]
 
 _ai_client     = None
 _ai_model_name = None
 
-if GEMINI_KEY:
+if GROQ_KEY:
     try:
-        from google import genai
-        _ai_client     = genai.Client(api_key=GEMINI_KEY)
-        _ai_model_name = GEMINI_MODELS[0]
-        print(f"  [AI] Ready 🧠  model={_ai_model_name}")
+        from groq import Groq
+        _ai_client     = Groq(api_key=GROQ_KEY)
+        _ai_model_name = GROQ_MODELS[0]
+        print(f"  [AI] Groq ready 🧠  model={_ai_model_name}")
     except ImportError:
-        print("  [AI] Missing: pip install google-genai")
+        print("  [AI] Missing: pip install groq")
     except Exception as e:
         print(f"  [AI] Init error: {e}")
 else:
-    print("  [AI] No API key — AI features disabled.")
+    print("  [AI] No GROQ_API_KEY — AI features disabled.")
 
 # ══════════════════════════════════════════════════════════
 #  SHARED HELPERS
@@ -103,35 +104,39 @@ def _clean_json_obj(text):
 #  so it never blocks the main server thread
 # ══════════════════════════════════════════════════════════
 def _ai_ask(prompt, max_tokens=512, temperature=0.7):
-    """Send prompt to Gemini with model fallback. Call only from worker threads."""
+    """
+    Send prompt to Groq with model fallback.
+    Groq is extremely fast — no sleep needed, rarely rate-limits on free tier.
+    Always call from a worker thread, never from the main server thread.
+    """
     if not _ai_client:
-        raise RuntimeError("AI client not initialised — set GEMINI_API_KEY")
+        raise RuntimeError("AI client not initialised — set GROQ_API_KEY")
 
-    from google.genai import types
     global _ai_model_name
 
-    # Small delay to avoid 429s — safe here because we're always in a daemon thread
-    time.sleep(2)
-
     last_error = None
-    for model in GEMINI_MODELS:
+    for model in GROQ_MODELS:
         try:
-            response = _ai_client.models.generate_content(
+            response = _ai_client.chat.completions.create(
                 model=model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                )
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_tokens,
+                temperature=temperature,
             )
             _ai_model_name = model
-            return response.text
+            print(f"  [AI] ✓ Success with {model}")
+            return response.choices[0].message.content
         except Exception as e:
             last_error = e
-            print(f"  [AI] '{model}' failed: {e}")
-            continue
+            err_str = str(e)
+            print(f"  [AI] '{model}' failed: {err_str[:120]}")
+            # Only retry on rate limit errors
+            if "rate_limit" in err_str.lower() or "429" in err_str:
+                time.sleep(3)
+                continue
+            break
 
-    raise RuntimeError(f"All Gemini models failed. Last error: {last_error}")
+    raise RuntimeError(f"All Groq models failed. Last error: {last_error}")
 
 # ══════════════════════════════════════════════════════════
 #  AUDIO ENGINE
@@ -195,25 +200,38 @@ def _search_ytdlp(query, limit=10):
 
 def get_stream(vid):
     """
-    FIX: 'android' player client is blocked on server IPs (Hugging Face, etc.)
-    Use 'web' as primary, 'mweb' as fallback — both work on cloud servers.
+    Stream fix for cloud server IPs (Render, HF, etc.)
+    tv_embedded is the most reliable client for server IPs — no sign-in needed.
+    Falls back through multiple clients automatically.
     """
-    # Try web client first (most reliable on server IPs)
-    for client in ["web", "mweb", "ios"]:
+    # tv_embedded works best on cloud IPs — YouTube treats it as an embedded TV player
+    for client in ["tv_embedded", "mediaconnect", "web_creator", "web", "mweb"]:
         cmd = (
             f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
             f'--extractor-args "youtube:player_client={client}" '
-            f'--get-url --no-warnings '
+            f'--get-url --no-warnings --no-check-certificates '
             f'"https://www.youtube.com/watch?v={vid}"'
         )
-        out, err, code = run_cmd(cmd, timeout=30)
+        out, err, code = run_cmd(cmd, timeout=35)
         url = out.strip().splitlines()[0] if out.strip() else ""
-        if url:
-            print(f"  [Stream] Got URL via client={client} for {vid}")
+        if url and url.startswith("http"):
+            print(f"  [Stream] ✓ Got URL via client={client} for {vid}")
             return url, None
-        print(f"  [Stream] client={client} failed for {vid}: {err[:100]}")
+        print(f"  [Stream] ✗ client={client} failed for {vid}: {err[:120]}")
 
-    return "", "All player clients failed — video may be unavailable"
+    # Last resort: try without specifying client at all
+    cmd = (
+        f'yt-dlp -f "bestaudio/best" '
+        f'--get-url --no-warnings --no-check-certificates '
+        f'"https://www.youtube.com/watch?v={vid}"'
+    )
+    out, err, _ = run_cmd(cmd, timeout=35)
+    url = out.strip().splitlines()[0] if out.strip() else ""
+    if url and url.startswith("http"):
+        print(f"  [Stream] ✓ Got URL via default client for {vid}")
+        return url, None
+
+    return "", "All player clients failed — video may be geo-blocked or unavailable"
 
 # ══════════════════════════════════════════════════════════
 #  JOB STORE
