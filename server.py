@@ -3,7 +3,7 @@ SMZ Music Player — Core Backend (AI Edition)
 Version: 5.0 — New google-genai SDK + No startup ping
 """
 
-import os, sys, json, subprocess, threading, re, random, string, glob, shutil
+import os, sys, json, subprocess, threading, re, random, string, glob, shutil, time
 from pathlib import Path
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
@@ -98,6 +98,10 @@ def _ai_ask(prompt, max_tokens=512, temperature=0.7):
 
     from google.genai import types
     global _ai_model_name
+
+    # --- THE RATE LIMIT FIX ---
+    # Pause for 2 seconds before asking Google, to prevent the 429 Quota Error
+    time.sleep(2) 
 
     last_error = None
     for model in GEMINI_MODELS:
@@ -369,3 +373,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n🛑 Server stopping...")
         server.server_close()
+
+
