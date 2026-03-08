@@ -1,9 +1,17 @@
+# Python
 venv/
 __pycache__/
 *.pyc
-downloads/
-*.log
+*.pyo
 .env
-/tmp/
+
+# Temporary folders
+tmp/
+downloads/
+
+# Windows binaries
 *.exe
-venv/
+
+# OS files
+.DS_Store
+Thumbs.db
