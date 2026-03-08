@@ -124,35 +124,46 @@ def _ai_ask(prompt, max_tokens=512, temperature=0.7):
     raise RuntimeError(f"All models failed. Last: {last_error}")
 
 # ══════════════════════════════════════════════════════════
-#  YT-DLP AUDIO ENGINE
+#  AUDIO ENGINE (ytmusicapi + yt-dlp)
 # ══════════════════════════════════════════════════════════
+from ytmusicapi import YTMusic
+_ytm = YTMusic()
+
 def search_audio(query, limit=10):
-    cmd = (f'yt-dlp "ytsearch{limit}:{query} audio" '
-           f'--dump-json --flat-playlist --no-warnings --ignore-errors')
-    out, _, _ = run_cmd(cmd, timeout=30)
-    results, seen = [], set()
-    for line in out.splitlines():
-        if not line.strip(): continue
-        try:
-            d   = json.loads(line)
-            vid = d.get("id") or d.get("url", "").split("v=")[-1]
+    """Uses ytmusicapi for fast, unblockable searching"""
+    try:
+        search_results = _ytm.search(query, filter="songs", limit=limit)
+        results = []
+        seen = set()
+        
+        for item in search_results:
+            vid = item.get("videoId")
             if not vid or vid in seen: continue
-            title = d.get("title", "Unknown Track")
-            if any(w in title.lower() for w in ["reaction","live concert","full concert"]):
-                continue
             seen.add(vid)
+            
+            title = item.get("title", "Unknown Track")
+            artists = ", ".join([a.get("name", "") for a in item.get("artists", [])]) if item.get("artists") else "Unknown Artist"
+            
+            thumbs = item.get("thumbnails", [])
+            thumb = thumbs[-1]["url"] if thumbs else f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+            
             results.append({
-                "id":        vid,
-                "title":     title,
-                "uploader":  d.get("uploader") or d.get("channel", "Unknown Artist"),
-                "thumbnail": d.get("thumbnail") or f"https://i.ytimg.com/vi/{vid}/mqdefault.jpg"
+                "id": vid,
+                "title": title,
+                "uploader": artists,
+                "thumbnail": thumb
             })
-        except: continue
-    return results
+        return results
+    except Exception as e:
+        print(f"  [Search] Error: {e}")
+        return []
 
 def get_stream(vid):
+    """Uses yt-dlp to extract the actual audio URL, spoofing an Android client to bypass blocks"""
     cmd = (f'yt-dlp -f "bestaudio[ext=m4a]/bestaudio/best" '
+           f'--extractor-args "youtube:player_client=android" '
            f'--get-url --no-warnings "https://www.youtube.com/watch?v={vid}"')
+    
     out, err, _ = run_cmd(cmd, timeout=30)
     url = out.strip().splitlines()[0] if out.strip() else ""
     return url, (err if not url else None)
