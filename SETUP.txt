@@ -1,0 +1,85 @@
+# GrooveBox — Setup Guide
+# ===============================================
+# Your personal, ad-free music streaming app
+# Streams from YouTube · Imports Spotify playlists
+# Downloads MP3s for offline listening
+# ===============================================
+
+STEP 1 — Install Python
+──────────────────────
+  Check if already installed:
+    python --version   (or python3 --version on Mac/Linux)
+
+  If not installed:
+    Windows: https://www.python.org/downloads/
+    Mac:     https://www.python.org/downloads/
+    Linux:   sudo apt install python3 python3-pip
+
+STEP 2 — Install yt-dlp  (streams YouTube ad-free)
+──────────────────────
+    pip install yt-dlp
+    (or: pip3 install yt-dlp)
+
+STEP 3 — Install spotdl  (imports Spotify playlists)
+──────────────────────
+    pip install spotdl
+    (or: pip3 install spotdl)
+
+STEP 4 — Install ffmpeg  (converts audio to MP3)
+──────────────────────
+  Mac:
+    brew install ffmpeg
+    (install Homebrew first at https://brew.sh if needed)
+
+  Windows:
+    1. Download from: https://www.gyan.dev/ffmpeg/builds/
+       → get "ffmpeg-release-essentials.zip"
+    2. Extract to C:\ffmpeg
+    3. Add C:\ffmpeg\bin to PATH:
+       Search "Environment Variables" → System Variables → Path → New → C:\ffmpeg\bin
+    4. Restart your terminal
+
+  Linux:
+    sudo apt install ffmpeg
+
+STEP 5 — Run the app
+──────────────────────
+  1. Put the "musicapp" folder anywhere you like (e.g. Desktop)
+  2. Open Terminal / Command Prompt
+  3. Navigate to the folder:
+       cd Desktop/musicapp     (Windows)
+       cd ~/Desktop/musicapp   (Mac/Linux)
+  4. Run:
+       python server.py
+  5. Open your browser at: http://localhost:5000
+
+STEP 6 — Share with friends on WiFi
+──────────────────────
+  When the server starts it shows:
+    Open on THIS computer:  http://localhost:5000
+    Open on other devices:  http://192.168.x.x:5000   ← share this
+
+  Anyone on the same WiFi can open that link!
+  For internet access, look into "ngrok" (free).
+
+USING THE APP
+──────────────────────
+  Search:          Type any song/artist → click Search → click any result
+  Spotify import:  Paste playlist URL in sidebar → click Import
+  Download MP3:    Click ⬇️ on any song (saves to /downloads folder)
+  Offline play:    Click "Downloads" in sidebar → play any saved MP3
+  Queue:           Click + to add songs → they play in order
+
+NOTES
+──────────────────────
+  - All audio streams via yt-dlp bypassing YouTube ads
+  - Downloaded MP3s are 320kbps (best quality available)
+  - The "downloads" folder is created automatically next to server.py
+  - yt-dlp updates frequently — run "pip install -U yt-dlp" if things break
+
+TROUBLESHOOTING
+──────────────────────
+  "command not found: python"  → use "python3" instead
+  Stream fails                 → run: pip install -U yt-dlp
+  Spotify import fails         → run: pip install -U spotdl
+  Port 5000 in use             → edit server.py line "port = 5000" to 5001
