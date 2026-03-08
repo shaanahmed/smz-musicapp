@@ -393,10 +393,10 @@ async function play(idx,q){
     else { img.style.display='none'; ph.style.display='flex'; }
 
     try{
-        const r=await fetch('/api/stream?id='+encodeURIComponent(s.id));
-        const d=await r.json();
-        if(d.error){ hideLoad(); toast('❌ Stream Error'); return; }
-        aud.src=d.url; aud.load(); aud.play();
+        aud.src='/api/stream?id='+encodeURIComponent(s.id);
+        aud.load();
+        aud.play();
+        hideLoad();
     }catch{ hideLoad(); toast('❌ Connection error'); }
 
     renderTab();
